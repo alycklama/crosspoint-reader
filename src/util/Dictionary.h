@@ -184,8 +184,8 @@ class Dictionary {
   // exact-case key and once (only if needed) for the case-folded key. OR's any
   // read failure into searchFailed rather than overwriting it, so a failure in
   // an earlier attempt isn't lost if a later attempt cleanly misses.
-  DictLocation lookupKey(LookupSession& session, const std::string& key, WordCmp cmp,
-                         std::string& matchedHeadwordOut, bool& searchFailed);
+  DictLocation lookupKey(LookupSession& session, const std::string& key, WordCmp cmp, std::string& matchedHeadwordOut,
+                         bool& searchFailed);
 
   // One streaming pass over sourcePath writing a sampled-offset sidecar. Each
   // source entry is a NUL-terminated word followed by suffixBytes fixed bytes
