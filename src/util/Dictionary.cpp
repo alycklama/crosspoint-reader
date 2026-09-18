@@ -354,15 +354,18 @@ bool Dictionary::openSynonyms(LookupSession& session) {
 // both sidecars have the same layout and both sources are sorted word-first, so
 // the descent is identical and only the file pair differs.
 //
-// cmp must match how the source is actually sorted on disk, or the descent
-// converges on the wrong region: StarDict sorts via ASCII-insensitive
+// cmp must match how the source is actually sorted on disk, or a bisecting
+// descent converges on the wrong region: StarDict sorts via ASCII-insensitive
 // comparison with non-ASCII bytes compared raw (an exact-byte tiebreak orders
 // entries that differ only by case, e.g. a proper noun vs. a common noun), so
-// the exact-case lookup attempt must pass StringUtils::asciiCaseCmp. The
-// case-folded retry attempt (only made if that misses) passes
-// utf8CaseInsensitiveCmp instead, trading exact on-disk order for the ability
-// to find a lowercase headword from a query that's merely capitalized by
-// sentence position.
+// the exact-case lookup attempt passes StringUtils::asciiCaseCmp and bisects.
+// The case-folded retry attempt (only made if that misses) passes
+// utf8CaseInsensitiveCmp instead, to find a lowercase headword from a query
+// that's merely capitalized by sentence position — but that comparator folds
+// non-ASCII codepoints the on-disk sort leaves raw, so it does not agree with
+// the on-disk order. locate()/locateSynonym() take cmpMatchesOrder=false for
+// that retry and fall back to a full linear scan from byte 0 instead of
+// bisecting or stopping early.
 uint32_t Dictionary::bisectSamples(HalFile& sidecar, HalFile& source, uint32_t sampleCount, const char* target,
                                    const WordCmp cmp) {
   uint32_t startByte = 0;
@@ -391,14 +394,20 @@ uint32_t Dictionary::bisectSamples(HalFile& sidecar, HalFile& source, uint32_t s
 // Both files stay open across the stem-variant probes; every read below seeks
 // absolutely first, so a shared handle carries no position state between calls.
 DictLocation Dictionary::locate(LookupSession& session, const char* target, const WordCmp cmp,
-                                std::string* matchedHeadwordOut) {
+                                const bool cmpMatchesOrder, std::string* matchedHeadwordOut) {
   DictLocation result;
 
   // Bisect the sampled offsets to the last sample whose headword <= target.
-  const uint32_t startByte = bisectSamples(session.qidx, session.idx, session.sampleCount, target, cmp);
+  // Only sound when cmp agrees with the on-disk order — otherwise scan every
+  // entry from byte 0 (see the comment above bisectSamples()).
+  const uint32_t startByte =
+      cmpMatchesOrder ? bisectSamples(session.qidx, session.idx, session.sampleCount, target, cmp) : 0;
 
-  // Linear scan of at most SAMPLE_INTERVAL entries: headword NUL, BE32 offset,
-  // BE32 size. The index is sorted, so stop at the first headword > target.
+  // Linear scan: headword NUL, BE32 offset, BE32 size. When cmp matches the
+  // on-disk order this is sorted, so stop at the first headword > target and
+  // it costs at most SAMPLE_INTERVAL entries; otherwise every entry must be
+  // checked since a fold-order "greater than" doesn't bound where a match
+  // could be on disk.
   if (!session.idx.seekSet(startByte)) {
     LOG_ERR("DICT", "Index seek to %lu failed", static_cast<unsigned long>(startByte));
     result.readError = true;
@@ -421,7 +430,7 @@ DictLocation Dictionary::locate(LookupSession& session, const char* target, cons
       if (matchedHeadwordOut) *matchedHeadwordOut = wordBuf;
       return result;
     }
-    if (c > 0) break;
+    if (cmpMatchesOrder && c > 0) break;
   }
   return result;
 }
@@ -468,7 +477,7 @@ DictLocation Dictionary::locateByOrdinal(LookupSession& session, uint32_t ordina
 }
 
 DictLocation Dictionary::locateSynonym(LookupSession& session, const char* target, const WordCmp cmp,
-                                       std::string* matchedHeadwordOut) {
+                                       const bool cmpMatchesOrder, std::string* matchedHeadwordOut) {
   DictLocation result;
   if (!openSynonyms(session)) {
     result.readError = session.synFailed;  // false when there is simply no .syn
@@ -476,12 +485,15 @@ DictLocation Dictionary::locateSynonym(LookupSession& session, const char* targe
   }
 
   // Bisect the sampled offsets to the last synonym <= target, same descent
-  // locate() runs over .qidx/.idx.
-  const uint32_t startByte = bisectSamples(session.sidx, session.syn, session.synSampleCount, target, cmp);
+  // locate() runs over .qidx/.idx — only sound when cmp matches the on-disk
+  // order (see locate()).
+  const uint32_t startByte =
+      cmpMatchesOrder ? bisectSamples(session.sidx, session.syn, session.synSampleCount, target, cmp) : 0;
 
-  // Linear scan of at most SAMPLE_INTERVAL entries: synonym NUL, BE32 ordinal.
-  // Sorted, so stop at the first synonym > target. Reading the ordinal before
-  // calling locateByOrdinal() (which reuses wordBuf) avoids any aliasing.
+  // Linear scan: synonym NUL, BE32 ordinal. When cmp matches the on-disk order
+  // this is sorted, so stop at the first synonym > target; otherwise every
+  // entry must be checked (see locate()). Reading the ordinal before calling
+  // locateByOrdinal() (which reuses wordBuf) avoids any aliasing.
   if (!session.syn.seekSet(startByte)) {
     LOG_ERR("DICT", "Synonym seek to %lu failed", static_cast<unsigned long>(startByte));
     result.readError = true;
@@ -494,7 +506,7 @@ DictLocation Dictionary::locateSynonym(LookupSession& session, const char* targe
 
     const int c = cmp(wordBuf, target);
     if (c == 0) return locateByOrdinal(session, readBe32(ordBytes), matchedHeadwordOut);
-    if (c > 0) break;
+    if (cmpMatchesOrder && c > 0) break;
   }
   return result;
 }
@@ -636,14 +648,14 @@ void Dictionary::stemVariants(const std::string& word, std::vector<std::string>&
 }
 
 DictLocation Dictionary::lookupKey(LookupSession& session, const std::string& key, const WordCmp cmp,
-                                   std::string& matchedHeadwordOut, bool& searchFailed) {
-  DictLocation location = locate(session, key.c_str(), cmp, &matchedHeadwordOut);
+                                   const bool cmpMatchesOrder, std::string& matchedHeadwordOut, bool& searchFailed) {
+  DictLocation location = locate(session, key.c_str(), cmp, cmpMatchesOrder, &matchedHeadwordOut);
   searchFailed = searchFailed || location.readError;
 
   // Dictionary-authored synonyms (alternate spellings, irregular forms) take
   // precedence over the English-only stemmer, and are language-agnostic.
   if (!location.found && hasSyn) {
-    location = locateSynonym(session, key.c_str(), cmp, &matchedHeadwordOut);
+    location = locateSynonym(session, key.c_str(), cmp, cmpMatchesOrder, &matchedHeadwordOut);
     searchFailed = searchFailed || location.readError;
   }
 
@@ -651,7 +663,7 @@ DictLocation Dictionary::lookupKey(LookupSession& session, const std::string& ke
     std::vector<std::string> variants;
     stemVariants(key, variants);
     for (const auto& variant : variants) {
-      location = locate(session, variant.c_str(), cmp, &matchedHeadwordOut);
+      location = locate(session, variant.c_str(), cmp, cmpMatchesOrder, &matchedHeadwordOut);
       searchFailed = searchFailed || location.readError;
       if (location.found) break;
     }
@@ -682,16 +694,19 @@ bool Dictionary::lookup(const char* word, std::string& definitionOut, std::strin
     }
 
     // Try the word exactly as selected first, with the comparator matching the
-    // .idx/.syn's actual on-disk sort order (see bisectSamples). Only if that
-    // misses, and folding actually changes the word (it has an uppercase
-    // letter), retry fully case-folded — see lookup()'s header comment for why
-    // this order matters.
-    location = lookupKey(session, cleaned, StringUtils::asciiCaseCmp, matchedHeadwordOut, searchFailed);
+    // .idx/.syn's actual on-disk sort order (see bisectSamples), so the
+    // descent can bisect and stop early. Only if that misses, and folding
+    // actually changes the word (it has an uppercase letter), retry fully
+    // case-folded; that comparator doesn't match the on-disk order (see
+    // locate()), so cmpMatchesOrder=false forces a full linear scan instead.
+    location = lookupKey(session, cleaned, StringUtils::asciiCaseCmp, /*cmpMatchesOrder=*/true, matchedHeadwordOut,
+                         searchFailed);
 
     if (!location.found) {
       const std::string folded = foldCase(cleaned);
       if (folded != cleaned) {
-        location = lookupKey(session, folded, utf8CaseInsensitiveCmp, matchedHeadwordOut, searchFailed);
+        location = lookupKey(session, folded, utf8CaseInsensitiveCmp, /*cmpMatchesOrder=*/false, matchedHeadwordOut,
+                             searchFailed);
       }
     }
   }
