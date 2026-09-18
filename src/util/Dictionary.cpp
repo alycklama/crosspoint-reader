@@ -88,6 +88,17 @@ IfoFacts readIfoFacts(const std::string& ifoPath) {
   return facts;
 }
 
+// Matches the .idx/.syn's actual on-disk sort order: primary key is
+// StringUtils::asciiCaseCmp (ASCII-insensitive, non-ASCII bytes compared raw),
+// with ties — entries that differ only by ASCII case, e.g. a proper noun
+// sharing a spelling with a common noun — broken by exact byte value. Without
+// this tiebreak, a case-insensitive-only comparator would report a tied entry
+// as an exact match regardless of which one it lands on first.
+int diskOrderCmp(const char* a, const char* b) {
+  const int primary = StringUtils::asciiCaseCmp(a, b);
+  return primary != 0 ? primary : strcmp(a, b);
+}
+
 }  // namespace
 
 bool Dictionary::open(const char* folderName) {
@@ -356,16 +367,19 @@ bool Dictionary::openSynonyms(LookupSession& session) {
 //
 // cmp must match how the source is actually sorted on disk, or a bisecting
 // descent converges on the wrong region: StarDict sorts via ASCII-insensitive
-// comparison with non-ASCII bytes compared raw (an exact-byte tiebreak orders
-// entries that differ only by case, e.g. a proper noun vs. a common noun), so
-// the exact-case lookup attempt passes StringUtils::asciiCaseCmp and bisects.
-// The case-folded retry attempt (only made if that misses) passes
-// utf8CaseInsensitiveCmp instead, to find a lowercase headword from a query
-// that's merely capitalized by sentence position — but that comparator folds
-// non-ASCII codepoints the on-disk sort leaves raw, so it does not agree with
-// the on-disk order. locate()/locateSynonym() take cmpMatchesOrder=false for
-// that retry and fall back to a full linear scan from byte 0 instead of
-// bisecting or stopping early.
+// comparison with non-ASCII bytes compared raw, with an exact-byte tiebreak
+// for entries that differ only by case (e.g. a proper noun vs. a common
+// noun), so the exact-case lookup attempt passes diskOrderCmp and bisects —
+// the tiebreak means an exact-case match is preferred over a case-variant
+// sharing the same fold, rather than whichever one the scan happens to reach
+// first. The case-folded retry attempt (always made if that misses) passes
+// utf8CaseInsensitiveCmp instead, to find a headword regardless of case —
+// e.g. a query merely capitalized by sentence position, or a case-variant
+// diskOrderCmp's tiebreak caused the exact-case scan to walk past. That
+// comparator folds non-ASCII codepoints the on-disk sort leaves raw, so it
+// does not agree with the on-disk order; locate()/locateSynonym() take
+// cmpMatchesOrder=false for that retry and fall back to a full linear scan
+// from byte 0 instead of bisecting or stopping early.
 uint32_t Dictionary::bisectSamples(HalFile& sidecar, HalFile& source, uint32_t sampleCount, const char* target,
                                    const WordCmp cmp) {
   uint32_t startByte = 0;
@@ -694,20 +708,20 @@ bool Dictionary::lookup(const char* word, std::string& definitionOut, std::strin
     }
 
     // Try the word exactly as selected first, with the comparator matching the
-    // .idx/.syn's actual on-disk sort order (see bisectSamples), so the
-    // descent can bisect and stop early. Only if that misses, and folding
-    // actually changes the word (it has an uppercase letter), retry fully
-    // case-folded; that comparator doesn't match the on-disk order (see
-    // locate()), so cmpMatchesOrder=false forces a full linear scan instead.
-    location = lookupKey(session, cleaned, StringUtils::asciiCaseCmp, /*cmpMatchesOrder=*/true, matchedHeadwordOut,
-                         searchFailed);
+    // .idx/.syn's actual on-disk sort order including its exact-byte tiebreak
+    // (see diskOrderCmp / bisectSamples), so the descent can bisect and stop
+    // early, and an exact-case match wins over a same-fold case variant. That
+    // tiebreak means the scan can walk past a case variant it would otherwise
+    // have accepted, so on any miss — regardless of whether folding changes
+    // the word — retry fully case-folded; that comparator doesn't match the
+    // on-disk order (see locate()), so cmpMatchesOrder=false forces a full
+    // linear scan instead.
+    location = lookupKey(session, cleaned, diskOrderCmp, /*cmpMatchesOrder=*/true, matchedHeadwordOut, searchFailed);
 
     if (!location.found) {
       const std::string folded = foldCase(cleaned);
-      if (folded != cleaned) {
-        location = lookupKey(session, folded, utf8CaseInsensitiveCmp, /*cmpMatchesOrder=*/false, matchedHeadwordOut,
-                             searchFailed);
-      }
+      location = lookupKey(session, folded, utf8CaseInsensitiveCmp, /*cmpMatchesOrder=*/false, matchedHeadwordOut,
+                           searchFailed);
     }
   }
   if (!location.found) {

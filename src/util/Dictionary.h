@@ -102,11 +102,11 @@ class Dictionary {
   static constexpr uint32_t SAMPLE_INTERVAL = 256;
 
   // Comparator used to scan an index. lookup() picks which one to pass:
-  // StringUtils::asciiCaseCmp (ASCII-insensitive, non-ASCII bytes compared raw
-  // — matches the .idx/.syn's actual on-disk order) for the exact-case
-  // attempt, or utf8CaseInsensitiveCmp (full Unicode fold) for the case-folded
-  // retry. Passed through explicitly rather than hardcoded so the same
-  // bisect/scan code serves both without duplicating it. Only the former
+  // diskOrderCmp (ASCII-insensitive with an exact-byte tiebreak, non-ASCII
+  // bytes compared raw — matches the .idx/.syn's actual on-disk order) for the
+  // exact-case attempt, or utf8CaseInsensitiveCmp (full Unicode fold) for the
+  // case-folded retry. Passed through explicitly rather than hardcoded so the
+  // same bisect/scan code serves both without duplicating it. Only the former
   // matches the on-disk sort order (see cmpMatchesOrder on locate() /
   // locateSynonym() / lookupKey()).
   using WordCmp = int (*)(const char*, const char*);
@@ -173,8 +173,8 @@ class Dictionary {
   uint32_t bisectSamples(HalFile& sidecar, HalFile& source, uint32_t sampleCount, const char* target, WordCmp cmp);
 
   // cmpMatchesOrder must be true only when cmp agrees with the source's actual
-  // on-disk sort order (StringUtils::asciiCaseCmp). When false (the
-  // case-folded retry's utf8CaseInsensitiveCmp, which folds non-ASCII
+  // on-disk sort order (diskOrderCmp). When false (the case-folded retry's
+  // utf8CaseInsensitiveCmp, which folds non-ASCII
   // codepoints the on-disk sort leaves raw), bisection and early termination
   // are both unsound — a fold-order "greater than" doesn't imply every later
   // on-disk entry is also greater, so locate()/locateSynonym() instead scan
