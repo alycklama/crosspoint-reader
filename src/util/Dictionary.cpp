@@ -6,7 +6,6 @@
 #include <Utf8.h>
 
 #include <algorithm>
-#include <cctype>
 #include <cstdio>
 #include <cstring>
 
@@ -59,21 +58,6 @@ bool readSampleOffset(HalFile& file, uint32_t sampleIndex, uint32_t* out) {
 uint32_t readBe32(const uint8_t* p) {
   return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
          (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
-}
-
-// Punctuation/symbol codepoint blocks stripped from word edges before lookup:
-// Latin-1 Supplement symbols (guillemets, inverted ?/!, ...), General and
-// Supplemental Punctuation (curly quotes, dashes, ...), CJK and fullwidth
-// punctuation. Scripts outside these blocks (Greek, Cyrillic, combining
-// marks, ...) are left alone so accented words keep their edges.
-bool isPunctuationCodepoint(const uint32_t cp) {
-  return (cp >= 0x00A0 && cp <= 0x00BF) || (cp >= 0x2000 && cp <= 0x206F) || (cp >= 0x2E00 && cp <= 0x2E7F) ||
-         (cp >= 0x3000 && cp <= 0x303F) || (cp >= 0xFE10 && cp <= 0xFE6F) || (cp >= 0xFF01 && cp <= 0xFF0F) ||
-         (cp >= 0xFF1A && cp <= 0xFF20) || (cp >= 0xFF3B && cp <= 0xFF40) || (cp >= 0xFF5B && cp <= 0xFF65);
-}
-
-bool isWordCodepoint(const uint32_t cp) {
-  return cp < 0x80 ? std::isalnum(static_cast<int>(cp)) != 0 : !isPunctuationCodepoint(cp);
 }
 
 // Facts read from the .ifo at open time. Only the first 2KB is scanned — .ifo
@@ -579,16 +563,17 @@ bool Dictionary::readDefinition(const DictLocation& location, std::string& out, 
 
 std::string Dictionary::cleanWord(const char* word) {
   if (!word) return "";
-  // Single forward pass so multi-byte punctuation (quotes, guillemets, ...) is
-  // decoded and classified as a whole codepoint, not peeked at byte-by-byte:
-  // a byte-level check can't tell a punctuation lead byte from a letter's.
+  // Single forward pass: decode codepoints and keep the span from the first
+  // to the last one classified as a word character, dropping any
+  // punctuation/symbol run at either edge (utf8IsWordChar is Unicode-category
+  // driven, so this works uniformly across scripts).
   const auto* p = reinterpret_cast<const unsigned char*>(word);
   const unsigned char* wordStart = nullptr;
   const unsigned char* wordEnd = nullptr;
   while (*p != 0) {
     const unsigned char* cpStart = p;
     const uint32_t cp = utf8NextCodepoint(&p);
-    if (isWordCodepoint(cp)) {
+    if (utf8IsWordChar(cp)) {
       if (!wordStart) wordStart = cpStart;
       wordEnd = p;
     }
