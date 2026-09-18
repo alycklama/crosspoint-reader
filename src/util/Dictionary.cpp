@@ -11,7 +11,6 @@
 
 #include "DictZip.h"
 #include "DictionaryRegistry.h"
-#include "StringUtils.h"
 
 namespace {
 
@@ -353,6 +352,13 @@ bool Dictionary::openSynonyms(LookupSession& session) {
 // Shared by locate() (.qidx over .idx) and locateSynonym() (.sidx over .syn):
 // both sidecars have the same layout and both sources are sorted word-first, so
 // the descent is identical and only the file pair differs.
+//
+// asciiCaseCmp only folds ASCII, so it can't compare non-ASCII headwords
+// case-insensitively. utf8CaseInsensitiveCmp folds both sides (re-folding
+// target is a no-op) so the on-disk, unfolded headword bytes match the
+// already-folded query. Assumes .idx/.syn are sorted case-insensitively —
+// the StarDict convention, and the same assumption asciiCaseCmp already
+// made here for ASCII.
 uint32_t Dictionary::bisectSamples(HalFile& sidecar, HalFile& source, uint32_t sampleCount, const char* target) {
   uint32_t startByte = 0;
   if (sampleCount == 0) return startByte;  // no usable sidecar: scan from the start
@@ -367,7 +373,7 @@ uint32_t Dictionary::bisectSamples(HalFile& sidecar, HalFile& source, uint32_t s
       lo = 0;  // unreadable sample: abandon the descent and scan from the start
       break;
     }
-    if (StringUtils::asciiCaseCmp(wordBuf, target) <= 0) {
+    if (utf8CaseInsensitiveCmp(wordBuf, target) <= 0) {
       lo = mid;
     } else {
       hi = mid - 1;
@@ -401,7 +407,7 @@ DictLocation Dictionary::locate(LookupSession& session, const char* target, std:
     uint8_t suffix[8];
     if (session.idx.read(suffix, 8) != 8) break;
 
-    const int cmp = StringUtils::asciiCaseCmp(wordBuf, target);
+    const int cmp = utf8CaseInsensitiveCmp(wordBuf, target);
     if (cmp == 0) {
       result.offset = readBe32(suffix);
       result.size = readBe32(suffix + 4);
@@ -479,7 +485,7 @@ DictLocation Dictionary::locateSynonym(LookupSession& session, const char* targe
     uint8_t ordBytes[4];
     if (session.syn.read(ordBytes, 4) != 4) break;
 
-    const int cmp = StringUtils::asciiCaseCmp(wordBuf, target);
+    const int cmp = utf8CaseInsensitiveCmp(wordBuf, target);
     if (cmp == 0) return locateByOrdinal(session, readBe32(ordBytes), matchedHeadwordOut);
     if (cmp > 0) break;
   }
@@ -584,7 +590,7 @@ std::string Dictionary::cleanWord(const char* word) {
   result.reserve(static_cast<size_t>(wordEnd - wordStart));
   const unsigned char* rp = wordStart;
   while (rp < wordEnd) {
-    utf8AppendCodepoint(utf8ToLowerSimple(utf8NextCodepoint(&rp)), result);
+    utf8AppendCodepoint(utf8SimpleCaseFold(utf8NextCodepoint(&rp)), result);
   }
   return result;
 }
