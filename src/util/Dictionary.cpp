@@ -11,6 +11,7 @@
 
 #include "DictZip.h"
 #include "DictionaryRegistry.h"
+#include "StringUtils.h"
 
 namespace {
 
@@ -353,13 +354,17 @@ bool Dictionary::openSynonyms(LookupSession& session) {
 // both sidecars have the same layout and both sources are sorted word-first, so
 // the descent is identical and only the file pair differs.
 //
-// asciiCaseCmp only folds ASCII, so it can't compare non-ASCII headwords
-// case-insensitively. utf8CaseInsensitiveCmp folds both sides (re-folding
-// target is a no-op) so the on-disk, unfolded headword bytes match the
-// already-folded query. Assumes .idx/.syn are sorted case-insensitively —
-// the StarDict convention, and the same assumption asciiCaseCmp already
-// made here for ASCII.
-uint32_t Dictionary::bisectSamples(HalFile& sidecar, HalFile& source, uint32_t sampleCount, const char* target) {
+// cmp must match how the source is actually sorted on disk, or the descent
+// converges on the wrong region: StarDict sorts via ASCII-insensitive
+// comparison with non-ASCII bytes compared raw (an exact-byte tiebreak orders
+// entries that differ only by case, e.g. a proper noun vs. a common noun), so
+// the exact-case lookup attempt must pass StringUtils::asciiCaseCmp. The
+// case-folded retry attempt (only made if that misses) passes
+// utf8CaseInsensitiveCmp instead, trading exact on-disk order for the ability
+// to find a lowercase headword from a query that's merely capitalized by
+// sentence position.
+uint32_t Dictionary::bisectSamples(HalFile& sidecar, HalFile& source, uint32_t sampleCount, const char* target,
+                                   const WordCmp cmp) {
   uint32_t startByte = 0;
   if (sampleCount == 0) return startByte;  // no usable sidecar: scan from the start
 
@@ -373,7 +378,7 @@ uint32_t Dictionary::bisectSamples(HalFile& sidecar, HalFile& source, uint32_t s
       lo = 0;  // unreadable sample: abandon the descent and scan from the start
       break;
     }
-    if (utf8CaseInsensitiveCmp(wordBuf, target) <= 0) {
+    if (cmp(wordBuf, target) <= 0) {
       lo = mid;
     } else {
       hi = mid - 1;
@@ -385,11 +390,12 @@ uint32_t Dictionary::bisectSamples(HalFile& sidecar, HalFile& source, uint32_t s
 
 // Both files stay open across the stem-variant probes; every read below seeks
 // absolutely first, so a shared handle carries no position state between calls.
-DictLocation Dictionary::locate(LookupSession& session, const char* target, std::string* matchedHeadwordOut) {
+DictLocation Dictionary::locate(LookupSession& session, const char* target, const WordCmp cmp,
+                                std::string* matchedHeadwordOut) {
   DictLocation result;
 
   // Bisect the sampled offsets to the last sample whose headword <= target.
-  const uint32_t startByte = bisectSamples(session.qidx, session.idx, session.sampleCount, target);
+  const uint32_t startByte = bisectSamples(session.qidx, session.idx, session.sampleCount, target, cmp);
 
   // Linear scan of at most SAMPLE_INTERVAL entries: headword NUL, BE32 offset,
   // BE32 size. The index is sorted, so stop at the first headword > target.
@@ -407,15 +413,15 @@ DictLocation Dictionary::locate(LookupSession& session, const char* target, std:
     uint8_t suffix[8];
     if (session.idx.read(suffix, 8) != 8) break;
 
-    const int cmp = utf8CaseInsensitiveCmp(wordBuf, target);
-    if (cmp == 0) {
+    const int c = cmp(wordBuf, target);
+    if (c == 0) {
       result.offset = readBe32(suffix);
       result.size = readBe32(suffix + 4);
       result.found = true;
       if (matchedHeadwordOut) *matchedHeadwordOut = wordBuf;
       return result;
     }
-    if (cmp > 0) break;
+    if (c > 0) break;
   }
   return result;
 }
@@ -461,7 +467,8 @@ DictLocation Dictionary::locateByOrdinal(LookupSession& session, uint32_t ordina
   return result;
 }
 
-DictLocation Dictionary::locateSynonym(LookupSession& session, const char* target, std::string* matchedHeadwordOut) {
+DictLocation Dictionary::locateSynonym(LookupSession& session, const char* target, const WordCmp cmp,
+                                       std::string* matchedHeadwordOut) {
   DictLocation result;
   if (!openSynonyms(session)) {
     result.readError = session.synFailed;  // false when there is simply no .syn
@@ -470,7 +477,7 @@ DictLocation Dictionary::locateSynonym(LookupSession& session, const char* targe
 
   // Bisect the sampled offsets to the last synonym <= target, same descent
   // locate() runs over .qidx/.idx.
-  const uint32_t startByte = bisectSamples(session.sidx, session.syn, session.synSampleCount, target);
+  const uint32_t startByte = bisectSamples(session.sidx, session.syn, session.synSampleCount, target, cmp);
 
   // Linear scan of at most SAMPLE_INTERVAL entries: synonym NUL, BE32 ordinal.
   // Sorted, so stop at the first synonym > target. Reading the ordinal before
@@ -485,9 +492,9 @@ DictLocation Dictionary::locateSynonym(LookupSession& session, const char* targe
     uint8_t ordBytes[4];
     if (session.syn.read(ordBytes, 4) != 4) break;
 
-    const int cmp = utf8CaseInsensitiveCmp(wordBuf, target);
-    if (cmp == 0) return locateByOrdinal(session, readBe32(ordBytes), matchedHeadwordOut);
-    if (cmp > 0) break;
+    const int c = cmp(wordBuf, target);
+    if (c == 0) return locateByOrdinal(session, readBe32(ordBytes), matchedHeadwordOut);
+    if (c > 0) break;
   }
   return result;
 }
@@ -572,7 +579,7 @@ std::string Dictionary::cleanWord(const char* word) {
   // Single forward pass: decode codepoints and keep the span from the first
   // to the last one classified as a word character, dropping any
   // punctuation/symbol run at either edge (utf8IsWordChar is Unicode-category
-  // driven, so this works uniformly across scripts).
+  // driven, so this works uniformly across scripts). Case is preserved.
   const auto* p = reinterpret_cast<const unsigned char*>(word);
   const unsigned char* wordStart = nullptr;
   const unsigned char* wordEnd = nullptr;
@@ -585,12 +592,15 @@ std::string Dictionary::cleanWord(const char* word) {
     }
   }
   if (!wordStart) return "";
+  return std::string(reinterpret_cast<const char*>(wordStart), wordEnd - wordStart);
+}
 
+std::string Dictionary::foldCase(const std::string& word) {
   std::string result;
-  result.reserve(static_cast<size_t>(wordEnd - wordStart));
-  const unsigned char* rp = wordStart;
-  while (rp < wordEnd) {
-    utf8AppendCodepoint(utf8SimpleCaseFold(utf8NextCodepoint(&rp)), result);
+  result.reserve(word.size());
+  const auto* p = reinterpret_cast<const unsigned char*>(word.c_str());
+  while (*p != 0) {
+    utf8AppendCodepoint(utf8SimpleCaseFold(utf8NextCodepoint(&p)), result);
   }
   return result;
 }
@@ -625,6 +635,30 @@ void Dictionary::stemVariants(const std::string& word, std::vector<std::string>&
   }
 }
 
+DictLocation Dictionary::lookupKey(LookupSession& session, const std::string& key, const WordCmp cmp,
+                                   std::string& matchedHeadwordOut, bool& searchFailed) {
+  DictLocation location = locate(session, key.c_str(), cmp, &matchedHeadwordOut);
+  searchFailed = searchFailed || location.readError;
+
+  // Dictionary-authored synonyms (alternate spellings, irregular forms) take
+  // precedence over the English-only stemmer, and are language-agnostic.
+  if (!location.found && hasSyn) {
+    location = locateSynonym(session, key.c_str(), cmp, &matchedHeadwordOut);
+    searchFailed = searchFailed || location.readError;
+  }
+
+  if (!location.found) {
+    std::vector<std::string> variants;
+    stemVariants(key, variants);
+    for (const auto& variant : variants) {
+      location = locate(session, variant.c_str(), cmp, &matchedHeadwordOut);
+      searchFailed = searchFailed || location.readError;
+      if (location.found) break;
+    }
+  }
+  return location;
+}
+
 bool Dictionary::lookup(const char* word, std::string& definitionOut, std::string& matchedHeadwordOut,
                         LookupResult* outResult) {
   const auto setResult = [outResult](LookupResult r) {
@@ -634,9 +668,8 @@ bool Dictionary::lookup(const char* word, std::string& definitionOut, std::strin
   const std::string cleaned = cleanWord(word);
   if (cleaned.empty() || !isOpen()) return false;
 
-  // One set of open handles for the exact-match probe, the synonym probe and
-  // every stem variant, scoped so .idx/.qidx (and .syn/.sidx) close before
-  // readDefinition() opens the data file.
+  // One set of open handles for every probe below, scoped so .idx/.qidx (and
+  // .syn/.sidx) close before readDefinition() opens the data file.
   DictLocation location;
   bool searchFailed = false;
   {
@@ -648,23 +681,17 @@ bool Dictionary::lookup(const char* word, std::string& definitionOut, std::strin
       return false;
     }
 
-    location = locate(session, cleaned.c_str(), &matchedHeadwordOut);
-    searchFailed = location.readError;
-
-    // Dictionary-authored synonyms (alternate spellings, irregular forms) take
-    // precedence over the English-only stemmer, and are language-agnostic.
-    if (!location.found && hasSyn) {
-      location = locateSynonym(session, cleaned.c_str(), &matchedHeadwordOut);
-      searchFailed = searchFailed || location.readError;
-    }
+    // Try the word exactly as selected first, with the comparator matching the
+    // .idx/.syn's actual on-disk sort order (see bisectSamples). Only if that
+    // misses, and folding actually changes the word (it has an uppercase
+    // letter), retry fully case-folded — see lookup()'s header comment for why
+    // this order matters.
+    location = lookupKey(session, cleaned, StringUtils::asciiCaseCmp, matchedHeadwordOut, searchFailed);
 
     if (!location.found) {
-      std::vector<std::string> variants;
-      stemVariants(cleaned, variants);
-      for (const auto& variant : variants) {
-        location = locate(session, variant.c_str(), &matchedHeadwordOut);
-        searchFailed = searchFailed || location.readError;
-        if (location.found) break;
+      const std::string folded = foldCase(cleaned);
+      if (folded != cleaned) {
+        location = lookupKey(session, folded, utf8CaseInsensitiveCmp, matchedHeadwordOut, searchFailed);
       }
     }
   }
