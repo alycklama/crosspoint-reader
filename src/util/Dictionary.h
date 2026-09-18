@@ -101,14 +101,12 @@ class Dictionary {
  private:
   static constexpr uint32_t SAMPLE_INTERVAL = 256;
 
-  // Comparator used to scan an index. lookup() picks which one to pass:
+  // Comparator used to bisect/scan an index. lookup() picks which one to pass:
   // diskOrderCmp (ASCII-insensitive with an exact-byte tiebreak, non-ASCII
   // bytes compared raw — matches the .idx/.syn's actual on-disk order) for the
   // exact-case attempt, or utf8CaseInsensitiveCmp (full Unicode fold) for the
   // case-folded retry. Passed through explicitly rather than hardcoded so the
-  // same bisect/scan code serves both without duplicating it. Only the former
-  // matches the on-disk sort order (see cmpMatchesOrder on locate() /
-  // locateSynonym() / lookupKey()).
+  // same bisect/scan code serves both without duplicating it.
   using WordCmp = int (*)(const char*, const char*);
 
   // Longest "<basePath><suffix>" the lookup path builds, rounded up. basePath is
@@ -168,19 +166,14 @@ class Dictionary {
   // byte offset of the last sampled entry whose word is <= target, so the caller
   // only has to linear-scan at most SAMPLE_INTERVAL entries from there. Returns
   // 0 — scan source from the start — when sampleCount is 0 or a sample is
-  // unreadable. Clobbers wordBuf. Only valid when cmp matches the source's
-  // actual on-disk sort order — see cmpMatchesOrder on locate() below.
+  // unreadable. Clobbers wordBuf. cmp must match the source's actual on-disk
+  // sort order (see the comment above bisectSamples() in the .cpp) — this is
+  // deliberately not exhaustive-scan-safe: every step touches the SD card
+  // through a mutex, so an unbounded fallback scan of a 100k+ entry .idx would
+  // blow well past the ~5s watchdog budget.
   uint32_t bisectSamples(HalFile& sidecar, HalFile& source, uint32_t sampleCount, const char* target, WordCmp cmp);
 
-  // cmpMatchesOrder must be true only when cmp agrees with the source's actual
-  // on-disk sort order (diskOrderCmp). When false (the case-folded retry's
-  // utf8CaseInsensitiveCmp, which folds non-ASCII
-  // codepoints the on-disk sort leaves raw), bisection and early termination
-  // are both unsound — a fold-order "greater than" doesn't imply every later
-  // on-disk entry is also greater, so locate()/locateSynonym() instead scan
-  // the whole source linearly from byte 0, checking every entry for equality.
-  DictLocation locate(LookupSession& session, const char* target, WordCmp cmp, bool cmpMatchesOrder,
-                      std::string* matchedHeadwordOut);
+  DictLocation locate(LookupSession& session, const char* target, WordCmp cmp, std::string* matchedHeadwordOut);
 
   // Resolve an ordinal (the N-th .idx entry, 0-based) to its .dict location via
   // the .qidx samples. Used to follow a .syn synonym back to its headword.
@@ -188,18 +181,15 @@ class Dictionary {
 
   // Bisect the .syn/.sidx synonym index for target; on a hit follow its ordinal
   // through locateByOrdinal(). Returns not-found when no .syn exists.
-  // cmpMatchesOrder: see locate().
-  DictLocation locateSynonym(LookupSession& session, const char* target, WordCmp cmp, bool cmpMatchesOrder,
-                             std::string* matchedHeadwordOut);
+  DictLocation locateSynonym(LookupSession& session, const char* target, WordCmp cmp, std::string* matchedHeadwordOut);
 
   // Try target via locate(), then (on a miss) dictionary synonyms, then English
   // mini stem variants — the shared probe sequence lookup() runs once for the
   // exact-case key and once (only if needed) for the case-folded key. OR's any
   // read failure into searchFailed rather than overwriting it, so a failure in
   // an earlier attempt isn't lost if a later attempt cleanly misses.
-  // cmpMatchesOrder: see locate().
-  DictLocation lookupKey(LookupSession& session, const std::string& key, WordCmp cmp, bool cmpMatchesOrder,
-                         std::string& matchedHeadwordOut, bool& searchFailed);
+  DictLocation lookupKey(LookupSession& session, const std::string& key, WordCmp cmp, std::string& matchedHeadwordOut,
+                         bool& searchFailed);
 
   // One streaming pass over sourcePath writing a sampled-offset sidecar. Each
   // source entry is a NUL-terminated word followed by suffixBytes fixed bytes
