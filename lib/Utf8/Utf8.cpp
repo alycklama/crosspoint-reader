@@ -2,6 +2,7 @@
 
 #include "Utf8CaseFoldTable.h"
 #include "Utf8ComposeTable.h"
+#include "Utf8WordCharTable.h"
 
 namespace {
 // Look up the canonical composition of (base + combining mark), or 0 if none.
@@ -223,4 +224,21 @@ uint32_t utf8ToLowerSimple(const uint32_t cp) {
     }
   }
   return cp;
+}
+
+bool utf8IsWordChar(const uint32_t cp) {
+  int lo = 0;
+  int hi = kUtf8WordCharTableSize - 1;
+  while (lo <= hi) {
+    const int mid = (lo + hi) / 2;
+    const Utf8WordCharRange& r = kUtf8WordCharTable[mid];
+    if (cp < r.start) {
+      hi = mid - 1;
+    } else if (cp > r.end) {
+      lo = mid + 1;
+    } else {
+      return true;
+    }
+  }
+  return false;
 }
