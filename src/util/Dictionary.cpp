@@ -369,18 +369,20 @@ bool Dictionary::openSynonyms(LookupSession& session) {
 // converges on the wrong region: StarDict sorts via ASCII-insensitive
 // comparison with non-ASCII bytes compared raw, with an exact-byte tiebreak
 // for entries that differ only by case (e.g. a proper noun vs. a common
-// noun), so the exact-case lookup attempt passes diskOrderCmp — the tiebreak
-// means an exact-case match is preferred over a case-variant sharing the same
-// fold, rather than whichever one the scan happens to reach first. The
-// case-folded retry attempt (only made if that misses, and only when folding
-// actually changes the word) passes utf8CaseInsensitiveCmp instead, to find a
-// lowercase headword from a query that's merely capitalized by sentence
-// position. That comparator folds non-ASCII codepoints the on-disk sort
-// leaves raw, so bisecting/stopping early with it is not fully sound for
-// non-ASCII case variants — accepted here rather than an unbounded scan:
-// every probe touches the SD card through a mutex, and a full-file linear
-// scan (this dictionary's .idx can hold 100k+ entries) blocks far past the
-// ~5s watchdog budget. Keep both passes bounded to ~SAMPLE_INTERVAL entries.
+// noun), so the exact-case lookup attempt, and the case-folded retry against
+// a plain lowercase headword, both pass diskOrderCmp — the tiebreak means an
+// exact-case match is preferred over a case-variant sharing the same fold,
+// rather than whichever one the scan happens to reach first, and the descent
+// stays sound because diskOrderCmp is compared against the same raw disk
+// order either way. Only the last-resort retry (both of the above missed)
+// passes utf8CaseInsensitiveCmp, for headwords that aren't a plain-lowercase
+// match of the fold (e.g. final-sigma, mixed-case entries). That comparator
+// folds non-ASCII codepoints the on-disk sort leaves raw, so bisecting/
+// stopping early with it is not fully sound for non-ASCII case variants —
+// accepted here rather than an unbounded scan: every probe touches the SD
+// card through a mutex, and a full-file linear scan (this dictionary's .idx
+// can hold 100k+ entries) blocks far past the ~5s watchdog budget. Keep every
+// pass bounded to ~SAMPLE_INTERVAL entries.
 uint32_t Dictionary::bisectSamples(HalFile& sidecar, HalFile& source, uint32_t sampleCount, const char* target,
                                    const WordCmp cmp) {
   uint32_t startByte = 0;
@@ -702,16 +704,27 @@ bool Dictionary::lookup(const char* word, std::string& definitionOut, std::strin
     // Try the word exactly as selected first, with the comparator matching the
     // .idx/.syn's actual on-disk sort order including its exact-byte tiebreak
     // (see diskOrderCmp / bisectSamples), so the descent can bisect and stop
-    // early, and an exact-case match wins over a same-fold case variant. Only
-    // if that misses, and folding actually changes the word (it has an
-    // uppercase letter), retry fully case-folded — see bisectSamples's header
-    // comment for why this stays bounded rather than exhaustive.
+    // early, and an exact-case match wins over a same-fold case variant.
     location = lookupKey(session, cleaned, diskOrderCmp, matchedHeadwordOut, searchFailed);
 
     if (!location.found) {
       const std::string folded = foldCase(cleaned);
       if (folded != cleaned) {
-        location = lookupKey(session, folded, utf8CaseInsensitiveCmp, matchedHeadwordOut, searchFailed);
+        // Most headwords are stored exactly lowercase, so retry the fully
+        // case-folded key with diskOrderCmp first: this is the same sound,
+        // on-disk-order descent as the exact-case attempt above (just against
+        // a different target string), so it correctly resolves the common
+        // "word capitalized only by sentence position" case — e.g. a Greek
+        // sentence-initial "Ήταν" folding to the headword "ήταν" — without
+        // relying on the unsound comparator below.
+        location = lookupKey(session, folded, diskOrderCmp, matchedHeadwordOut, searchFailed);
+        if (!location.found) {
+          // Last resort for headwords that aren't a plain-lowercase match of
+          // the fold (e.g. final-sigma, mixed-case entries) — see
+          // bisectSamples's header comment for why this stays bounded rather
+          // than exhaustive, and why it can still miss.
+          location = lookupKey(session, folded, utf8CaseInsensitiveCmp, matchedHeadwordOut, searchFailed);
+        }
       }
     }
   }
